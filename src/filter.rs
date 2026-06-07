@@ -1,21 +1,29 @@
+use std::borrow::Cow;
 use std::ops::RangeInclusive;
+use std::os::raw::c_char;
+use std::sync::OnceLock;
 
 use obs_wrapper::{
     data::DataObj,
     obs_string,
-    obs_sys::obs_source_frame,
+    obs_sys::{
+        obs_data_get_int, obs_data_t, obs_properties_get, obs_properties_t,
+        obs_property_set_modified_callback, obs_property_set_visible, obs_property_t,
+        obs_source_frame,
+    },
     prelude::*,
-    properties::{NumberProp, Properties},
+    properties::{NumberProp, PathProp, PathType, Properties},
     source::{
         CreatableSourceContext, FilterVideoSource, GetNameSource, GetPropertiesSource,
         SourceContext, SourceType, Sourceable, UpdateSource,
         video::{VideoDataContext, VideoFormat},
     },
+    wrapper::PtrWrapper,
 };
 
 use ntsc_rs::{
     ctx,
-    settings::standard::NtscEffect,
+    settings::{SettingsList, standard::NtscEffect},
     yiq_fielding::{
         Bgrx, BlitInfo, DeinterlaceMode, PixelFormat, Rgbx, Xbgr, Xrgb, YiqOwned, YiqView,
     },
@@ -29,6 +37,29 @@ use crate::yuv;
 // obs_string! requires literals, so keeping these in lockstep is intentional.
 const PROP_PRESET: &str = "preset";
 const PROP_INTENSITY: &str = "intensity";
+const PROP_CUSTOM_JSON: &str = "custom_json";
+
+fn settings_list() -> &'static SettingsList<NtscEffect> {
+    static LIST: OnceLock<SettingsList<NtscEffect>> = OnceLock::new();
+    LIST.get_or_init(SettingsList::<NtscEffect>::new)
+}
+
+fn load_preset_from_path(path: &str) -> Option<NtscEffect> {
+    let json = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("obs-ntsc: failed to read preset file {path:?}: {e}");
+            return None;
+        }
+    };
+    match settings_list().from_json(&json) {
+        Ok(effect) => Some(effect),
+        Err(e) => {
+            log::warn!("obs-ntsc: failed to parse preset JSON at {path:?}: {e:?}");
+            None
+        }
+    }
+}
 
 pub struct NtscFilter {
     base_effect: NtscEffect,
@@ -43,8 +74,18 @@ impl NtscFilter {
     fn read_settings(&mut self, settings: &DataObj) {
         let preset_raw = settings.get::<i64>(PROP_PRESET).unwrap_or(0);
         let intensity = settings.get::<f64>(PROP_INTENSITY).unwrap_or(1.0) as f32;
+        let preset = PresetId::from_i64(preset_raw);
 
-        self.base_effect = presets::for_id(PresetId::from_i64(preset_raw));
+        self.base_effect = match preset {
+            PresetId::Custom => {
+                let path = settings.get::<Cow<str>>(PROP_CUSTOM_JSON);
+                path.as_deref()
+                    .filter(|p| !p.is_empty())
+                    .and_then(load_preset_from_path)
+                    .unwrap_or_else(|| presets::for_id(PresetId::Vhs))
+            }
+            other => presets::for_id(other),
+        };
         self.intensity = intensity.clamp(0.0, 1.0);
     }
 }
@@ -88,7 +129,17 @@ impl GetPropertiesSource for NtscFilter {
         preset_list.push(obs_string!("VHS"), PresetId::Vhs.to_i64());
         preset_list.push(obs_string!("Broadcast"), PresetId::Broadcast.to_i64());
         preset_list.push(obs_string!("Composite"), PresetId::Composite.to_i64());
+        preset_list.push(obs_string!("Custom..."), PresetId::Custom.to_i64());
+        // Capture the raw property pointer before drop so we can attach a
+        // modified callback that toggles the JSON path field's visibility.
+        let preset_ptr = preset_list.as_ptr() as *mut obs_property_t;
         drop(preset_list);
+
+        props.add(
+            obs_string!("custom_json"),
+            obs_string!("Custom preset JSON"),
+            PathProp::new(PathType::File).with_filter(obs_string!("JSON (*.json)")),
+        );
 
         let intensity: RangeInclusive<f64> = 0.0..=1.0;
         props.add(
@@ -99,8 +150,33 @@ impl GetPropertiesSource for NtscFilter {
                 .with_slider(),
         );
 
+        // Wire up: when the preset dropdown changes, toggle the visibility of
+        // the JSON path field. OBS also fires this callback once when the
+        // properties dialog opens with saved settings applied, so initial
+        // visibility lands correctly on filter reopen.
+        unsafe {
+            obs_property_set_modified_callback(preset_ptr, Some(on_preset_changed));
+        }
+
         props
     }
+}
+
+/// C callback: shows/hides the JSON path field based on the current preset.
+/// Stateless — we look up the file-path property by name within the same
+/// properties object. Returns `true` to tell OBS the UI needs refreshing.
+unsafe extern "C" fn on_preset_changed(
+    props: *mut obs_properties_t,
+    _property: *mut obs_property_t,
+    settings: *mut obs_data_t,
+) -> bool {
+    let preset = unsafe { obs_data_get_int(settings, c"preset".as_ptr() as *const c_char) };
+    let custom_json = unsafe { obs_properties_get(props, c"custom_json".as_ptr() as *const c_char) };
+    if !custom_json.is_null() {
+        let is_custom = preset == PresetId::Custom.to_i64();
+        unsafe { obs_property_set_visible(custom_json, is_custom) };
+    }
+    true
 }
 
 impl UpdateSource for NtscFilter {

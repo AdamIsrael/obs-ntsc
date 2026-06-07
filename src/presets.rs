@@ -10,6 +10,7 @@ pub enum PresetId {
     Vhs,
     Broadcast,
     Composite,
+    Custom,
 }
 
 impl PresetId {
@@ -18,6 +19,7 @@ impl PresetId {
             0 => Self::Vhs,
             1 => Self::Broadcast,
             2 => Self::Composite,
+            3 => Self::Custom,
             _ => Self::Vhs,
         }
     }
@@ -27,6 +29,7 @@ impl PresetId {
             Self::Vhs => 0,
             Self::Broadcast => 1,
             Self::Composite => 2,
+            Self::Custom => 3,
         }
     }
 }
@@ -50,7 +53,7 @@ fn disabled<T: Default>() -> SettingsBlock<T> {
 pub fn for_id(id: PresetId) -> NtscEffect {
     let mut e = NtscEffect::default();
     match id {
-        PresetId::Vhs => vhs(&mut e),
+        PresetId::Vhs | PresetId::Custom => vhs(&mut e),
         PresetId::Broadcast => broadcast(&mut e),
         PresetId::Composite => composite(&mut e),
     }
