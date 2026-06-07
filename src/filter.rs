@@ -229,6 +229,12 @@ impl FilterVideoSource for NtscFilter {
             return;
         }
 
+        // At zero intensity, pass through untouched — skipping ntsc-rs *and*
+        // the YUV↔RGB roundtrip. Also keeps the slider feeling "off" at 0.
+        if self.intensity < 0.01 {
+            return;
+        }
+
         let effect = presets::apply_intensity(&self.base_effect, self.intensity);
         let frame_num = self.frame_num as usize;
         self.frame_num = self.frame_num.wrapping_add(1);
