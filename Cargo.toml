@@ -1,0 +1,16 @@
+[package]
+name = "obs-ntsc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "obs_ntsc"
+crate-type = ["cdylib"]
+
+[dependencies]
+obs-wrapper = "0.4"
+ntsc-rs = { git = "https://github.com/ntsc-rs/ntsc-rs", rev = "73c695dfc4c851436e8d27084d2fdcbd74d9aae0", features = ["rayon"] }
+log = "0.4"
+
+[profile.release]
+lto = "thin"
