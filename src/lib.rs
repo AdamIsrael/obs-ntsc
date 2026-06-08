@@ -6,6 +6,7 @@ mod yuv;
 use obs_wrapper::{
     log::Logger,
     obs_register_module, obs_string,
+    obs_sys::OBS_SOURCE_ASYNC_VIDEO,
     prelude::*,
     source::Sourceable,
 };
@@ -29,13 +30,19 @@ impl Module for ObsNtscModule {
         // Best-effort logger init; ignore Err if a logger was somehow already set.
         let _ = Logger::new().with_promote_debug(true).init();
 
-        let source = load_context
+        let mut source = load_context
             .create_source_builder::<NtscFilter>()
             .enable_get_name()
             .enable_get_properties()
             .enable_update()
             .enable_filter_video()
             .build();
+        // obs-wrapper's builder only sets OBS_SOURCE_VIDEO when video_render
+        // is wired and never sets OBS_SOURCE_ASYNC. For an async video filter
+        // (one that uses filter_video on raw frames), OBS expects
+        // OBS_SOURCE_ASYNC_VIDEO. Set it directly on the underlying
+        // obs_source_info before registering.
+        source.as_mut().output_flags |= OBS_SOURCE_ASYNC_VIDEO;
         load_context.register_source(source);
         log::info!("obs-ntsc loaded; filter registered");
         true
