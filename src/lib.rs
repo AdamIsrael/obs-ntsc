@@ -1,6 +1,8 @@
 mod colormatrix;
 mod filter;
 mod presets;
+mod properties;
+mod settings_io;
 mod yuv;
 
 use obs_wrapper::{
@@ -33,6 +35,7 @@ impl Module for ObsNtscModule {
         let mut source = load_context
             .create_source_builder::<NtscFilter>()
             .enable_get_name()
+            .enable_get_defaults()
             .enable_get_properties()
             .enable_update()
             .enable_filter_video()

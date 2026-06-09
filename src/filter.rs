@@ -1,21 +1,18 @@
-use std::borrow::Cow;
-use std::ops::RangeInclusive;
 use std::os::raw::c_char;
-use std::sync::OnceLock;
 
 use obs_wrapper::{
     data::DataObj,
     obs_string,
     obs_sys::{
-        obs_data_get_int, obs_data_t, obs_properties_get, obs_properties_t,
-        obs_property_set_modified_callback, obs_property_set_visible, obs_property_t,
+        obs_data_get_int, obs_data_get_string, obs_data_set_int, obs_data_set_string, obs_data_t,
+        obs_properties_get, obs_properties_t, obs_property_set_visible, obs_property_t,
         obs_source_frame,
     },
     prelude::*,
-    properties::{NumberProp, PathProp, PathType, Properties},
+    properties::Properties,
     source::{
-        CreatableSourceContext, FilterVideoSource, GetNameSource, GetPropertiesSource,
-        SourceContext, SourceType, Sourceable, UpdateSource,
+        CreatableSourceContext, FilterVideoSource, GetDefaultsSource, GetNameSource,
+        GetPropertiesSource, SourceContext, SourceType, Sourceable, UpdateSource,
         video::{VideoDataContext, VideoFormat},
     },
     wrapper::PtrWrapper,
@@ -23,7 +20,7 @@ use obs_wrapper::{
 
 use ntsc_rs::{
     ctx,
-    settings::{SettingsList, standard::NtscEffect},
+    settings::standard::NtscEffect,
     yiq_fielding::{
         Bgrx, BlitInfo, DeinterlaceMode, PixelFormat, Rgbx, Xbgr, Xrgb, YiqOwned, YiqView,
     },
@@ -31,35 +28,18 @@ use ntsc_rs::{
 
 use crate::colormatrix::ColorMatrix;
 use crate::presets::{self, PresetId};
+use crate::properties as ui;
+use crate::settings_io;
 use crate::yuv;
 
-// Property keys — duplicated as literals into obs_string! and as &str for DataObj::get<T>().
-// obs_string! requires literals, so keeping these in lockstep is intentional.
 const PROP_PRESET: &str = "preset";
 const PROP_INTENSITY: &str = "intensity";
-const PROP_CUSTOM_JSON: &str = "custom_json";
 
-fn settings_list() -> &'static SettingsList<NtscEffect> {
-    static LIST: OnceLock<SettingsList<NtscEffect>> = OnceLock::new();
-    LIST.get_or_init(SettingsList::<NtscEffect>::new)
-}
-
-fn load_preset_from_path(path: &str) -> Option<NtscEffect> {
-    let json = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("obs-ntsc: failed to read preset file {path:?}: {e}");
-            return None;
-        }
-    };
-    match settings_list().from_json(&json) {
-        Ok(effect) => Some(effect),
-        Err(e) => {
-            log::warn!("obs-ntsc: failed to parse preset JSON at {path:?}: {e:?}");
-            None
-        }
-    }
-}
+// Hidden sentinels: prevent re-overwriting user-tweaked sliders every time
+// OBS reopens the properties dialog. The modified callback only re-applies
+// preset values when the selection has actually changed since the last apply.
+const SENTINEL_LAST_PRESET: &core::ffi::CStr = c"_last_applied_preset";
+const SENTINEL_LAST_JSON: &core::ffi::CStr = c"_last_applied_json";
 
 pub struct NtscFilter {
     base_effect: NtscEffect,
@@ -71,21 +51,12 @@ pub struct NtscFilter {
 }
 
 impl NtscFilter {
-    fn read_settings(&mut self, settings: &DataObj) {
-        let preset_raw = settings.get::<i64>(PROP_PRESET).unwrap_or(0);
+    fn read_settings(&mut self, settings: &mut DataObj) {
+        // base_effect is now assembled from the per-parameter sliders, which
+        // are populated by the preset-changed callback (or directly by the
+        // user). Intensity still applies as a global scale.
+        self.base_effect = settings_io::read_effect(settings.as_ptr_mut());
         let intensity = settings.get::<f64>(PROP_INTENSITY).unwrap_or(1.0) as f32;
-        let preset = PresetId::from_i64(preset_raw);
-
-        self.base_effect = match preset {
-            PresetId::Custom => {
-                let path = settings.get::<Cow<str>>(PROP_CUSTOM_JSON);
-                path.as_deref()
-                    .filter(|p| !p.is_empty())
-                    .and_then(load_preset_from_path)
-                    .unwrap_or_else(|| presets::for_id(PresetId::Vhs))
-            }
-            other => presets::for_id(other),
-        };
         self.intensity = intensity.clamp(0.0, 1.0);
     }
 }
@@ -106,7 +77,7 @@ impl Sourceable for NtscFilter {
             frame_num: 0,
             rgba_scratch: Vec::new(),
         };
-        filter.read_settings(&create.settings);
+        filter.read_settings(&mut create.settings);
         filter
     }
 }
@@ -117,64 +88,152 @@ impl GetNameSource for NtscFilter {
     }
 }
 
-impl GetPropertiesSource for NtscFilter {
-    fn get_properties(&mut self) -> Properties {
-        let mut props = Properties::new();
-
-        let mut preset_list = props.add_list::<i64>(
-            obs_string!("preset"),
-            obs_string!("Preset"),
-            false,
-        );
-        preset_list.push(obs_string!("VHS"), PresetId::Vhs.to_i64());
-        preset_list.push(obs_string!("Broadcast"), PresetId::Broadcast.to_i64());
-        preset_list.push(obs_string!("Composite"), PresetId::Composite.to_i64());
-        preset_list.push(obs_string!("Custom..."), PresetId::Custom.to_i64());
-        // Capture the raw property pointer before drop so we can attach a
-        // modified callback that toggles the JSON path field's visibility.
-        let preset_ptr = preset_list.as_ptr() as *mut obs_property_t;
-        drop(preset_list);
-
-        props.add(
-            obs_string!("custom_json"),
-            obs_string!("Custom preset JSON"),
-            PathProp::new(PathType::File).with_filter(obs_string!("JSON (*.json)")),
-        );
-
-        let intensity: RangeInclusive<f64> = 0.0..=1.0;
-        props.add(
-            obs_string!("intensity"),
-            obs_string!("Intensity"),
-            NumberProp::new_float(0.01_f64)
-                .with_range(intensity)
-                .with_slider(),
-        );
-
-        // Wire up: when the preset dropdown changes, toggle the visibility of
-        // the JSON path field. OBS also fires this callback once when the
-        // properties dialog opens with saved settings applied, so initial
-        // visibility lands correctly on filter reopen.
-        unsafe {
-            obs_property_set_modified_callback(preset_ptr, Some(on_preset_changed));
-        }
-
-        props
+impl GetDefaultsSource for NtscFilter {
+    fn get_defaults(settings: &mut DataObj) {
+        // Seed defaults for every ntsc-rs parameter, derived from
+        // NtscEffect::default(). The current UI doesn't display them yet, but
+        // they're persisted so callers reading via obs_data_get_* (including
+        // future descriptor-driven code) see real numbers instead of zeros.
+        settings_io::set_defaults(settings.as_ptr_mut());
+        settings.set_default::<i64>(PROP_PRESET, PresetId::Vhs.to_i64());
+        settings.set_default::<f64>(PROP_INTENSITY, 1.0);
     }
 }
 
-/// C callback: shows/hides the JSON path field based on the current preset.
-/// Stateless — we look up the file-path property by name within the same
-/// properties object. Returns `true` to tell OBS the UI needs refreshing.
+impl GetPropertiesSource for NtscFilter {
+    fn get_properties(&mut self) -> Properties {
+        ui::build_properties(
+            settings_io::settings_list(),
+            Some(on_preset_changed),
+            Some(on_custom_json_changed),
+            Some(on_export_path_changed),
+        )
+    }
+}
+
+unsafe fn current_preset(settings: *mut obs_data_t) -> PresetId {
+    PresetId::from_i64(unsafe { obs_data_get_int(settings, c"preset".as_ptr()) })
+}
+
+unsafe fn current_json_path(settings: *mut obs_data_t) -> Option<String> {
+    let ptr = unsafe { obs_data_get_string(settings, c"custom_json".as_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    match cstr.to_str() {
+        Ok(s) if !s.is_empty() => Some(s.to_owned()),
+        _ => None,
+    }
+}
+
+unsafe fn set_json_visibility(props: *mut obs_properties_t, visible: bool) {
+    let p = unsafe { obs_properties_get(props, c"custom_json".as_ptr() as *const c_char) };
+    if !p.is_null() {
+        unsafe { obs_property_set_visible(p, visible) };
+    }
+}
+
+/// C callback: preset dropdown changed. Writes the chosen preset's NtscEffect
+/// values into settings only if the preset actually changed since the last
+/// apply (so customized sliders survive scene reopen).
 unsafe extern "C" fn on_preset_changed(
     props: *mut obs_properties_t,
     _property: *mut obs_property_t,
     settings: *mut obs_data_t,
 ) -> bool {
-    let preset = unsafe { obs_data_get_int(settings, c"preset".as_ptr() as *const c_char) };
-    let custom_json = unsafe { obs_properties_get(props, c"custom_json".as_ptr() as *const c_char) };
-    if !custom_json.is_null() {
-        let is_custom = preset == PresetId::Custom.to_i64();
-        unsafe { obs_property_set_visible(custom_json, is_custom) };
+    let preset = unsafe { current_preset(settings) };
+    let is_custom = preset == PresetId::Custom;
+    unsafe { set_json_visibility(props, is_custom) };
+
+    let last = unsafe { obs_data_get_int(settings, SENTINEL_LAST_PRESET.as_ptr()) };
+    if last == preset.to_i64() {
+        // Same selection as last apply — leave the user's slider values alone.
+        return true;
+    }
+
+    let effect = if is_custom {
+        unsafe { current_json_path(settings) }
+            .and_then(|p| settings_io::load_preset_from_path(&p))
+    } else {
+        Some(presets::for_id(preset))
+    };
+
+    if let Some(effect) = effect {
+        settings_io::apply_effect_to_settings(&effect, settings);
+        unsafe { obs_data_set_int(settings, SENTINEL_LAST_PRESET.as_ptr(), preset.to_i64()) };
+        if is_custom {
+            if let Some(p) = unsafe { current_json_path(settings) } {
+                if let Ok(cp) = std::ffi::CString::new(p) {
+                    unsafe {
+                        obs_data_set_string(settings, SENTINEL_LAST_JSON.as_ptr(), cp.as_ptr())
+                    };
+                }
+            }
+        }
+    }
+    true
+}
+
+/// C callback: user picked a save path for the current settings. Reads the
+/// current effect from settings, writes it to the picked path, then clears
+/// the field so the widget behaves as a one-click "save now" trigger.
+unsafe extern "C" fn on_export_path_changed(
+    _props: *mut obs_properties_t,
+    _property: *mut obs_property_t,
+    settings: *mut obs_data_t,
+) -> bool {
+    let path_ptr = unsafe { obs_data_get_string(settings, c"export_path".as_ptr()) };
+    if path_ptr.is_null() {
+        return false;
+    }
+    let path = match unsafe { std::ffi::CStr::from_ptr(path_ptr) }.to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return false,
+    };
+
+    let effect = settings_io::read_effect(settings);
+    match settings_io::save_effect_to_path(&effect, &path) {
+        Ok(()) => log::info!("obs-ntsc: saved preset to {path:?}"),
+        Err(e) => log::warn!("obs-ntsc: failed to save preset: {e}"),
+    }
+
+    // Clear the path so picking the same file again still triggers a save.
+    unsafe { obs_data_set_string(settings, c"export_path".as_ptr(), c"".as_ptr()) };
+    true
+}
+
+/// C callback: custom JSON path changed. Reloads + writes into settings only
+/// when the path differs from the last applied one (same survival rule as
+/// the preset callback).
+unsafe extern "C" fn on_custom_json_changed(
+    _props: *mut obs_properties_t,
+    _property: *mut obs_property_t,
+    settings: *mut obs_data_t,
+) -> bool {
+    if unsafe { current_preset(settings) } != PresetId::Custom {
+        return false;
+    }
+    let Some(path) = (unsafe { current_json_path(settings) }) else {
+        return false;
+    };
+
+    // Compare to last applied path.
+    let last_ptr = unsafe { obs_data_get_string(settings, SENTINEL_LAST_JSON.as_ptr()) };
+    if !last_ptr.is_null() {
+        if let Ok(last) = unsafe { std::ffi::CStr::from_ptr(last_ptr) }.to_str() {
+            if last == path {
+                return false;
+            }
+        }
+    }
+
+    let Some(effect) = settings_io::load_preset_from_path(&path) else {
+        return false;
+    };
+    settings_io::apply_effect_to_settings(&effect, settings);
+    if let Ok(cp) = std::ffi::CString::new(path) {
+        unsafe { obs_data_set_string(settings, SENTINEL_LAST_JSON.as_ptr(), cp.as_ptr()) };
     }
     true
 }
