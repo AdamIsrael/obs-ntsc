@@ -9,11 +9,25 @@ and other async video sources.
 
 ## Status
 
-v0.1. Built and tested on macOS / Apple Silicon against current OBS Studio
-(libobs 32.x). The Rust source is portable and other platforms (Linux,
-Windows, x86_64 macOS) are intended but not yet wired up in the build
-recipes. Not yet packaged for distribution — there's a `justfile` for
-building and installing locally.
+v0.1. GitHub Actions builds binaries for macOS (Apple Silicon, Intel, and
+a universal lipo), Linux x86_64, and Windows x86_64 on every `v*` tag,
+and attaches them to a draft GitHub Release. Personal testing has been
+on macOS Apple Silicon against OBS Studio 32.x; binaries for the other
+platforms are produced by CI but not yet user-validated.
+
+## Compatibility
+
+| OBS Studio | Status |
+|---|---|
+| 32.x | Tested on macOS Apple Silicon |
+| 30.x – 31.x | Expected to work; not tested |
+| 28.x – 29.x | Likely works — obs-sys 0.2.1's pre-generated bindings target this era |
+| &lt; 28 | Not supported |
+
+The plugin links against `libobs`. We haven't observed ABI breaks across the
+28 → 32 range, but only OBS 32.x has been user-tested by the author. If you
+hit an issue on an earlier version, please open an issue with the OBS log
+output.
 
 ## Features
 
@@ -33,12 +47,28 @@ building and installing locally.
 
 ## Requirements
 
-- macOS (current builds target Apple Silicon; see *Known limitations*)
-- [OBS Studio](https://obsproject.com/) installed in `/Applications/OBS.app`
-- Rust toolchain (`rustc`, `cargo`) — edition 2024
-- [`just`](https://github.com/casey/just) for the build/install recipes
+- macOS, Linux, or Windows (CI ships binaries for all of these — see
+  *Installation*).
+- [OBS Studio](https://obsproject.com/) version 28 or newer recommended.
+  On macOS the local justfile install expects OBS at `/Applications/OBS.app`.
+- To build from source: Rust toolchain (`rustc`, `cargo`) — edition 2024.
+- To use the local install recipe (macOS only):
+  [`just`](https://github.com/casey/just).
 
 ## Installation
+
+### From GitHub Releases
+
+Each tagged release has prebuilt binaries attached. Download the asset
+matching your platform and drop it into your OBS plugins directory:
+
+| Asset | Where it goes |
+|---|---|
+| `obs-ntsc-<ver>-macos-aarch64.zip` / `-x86_64.zip` / `-universal.zip` | Unzip and place `obs-ntsc.plugin` into `~/Library/Application Support/obs-studio/plugins/` |
+| `obs-ntsc-<ver>-linux-x86_64.tar.gz` | Extract `obs-ntsc.so` into `~/.config/obs-studio/plugins/obs-ntsc/bin/64bit/` |
+| `obs-ntsc-<ver>-windows-x86_64.zip` | Extract `obs-ntsc.dll` into `%APPDATA%\obs-studio\plugins\obs-ntsc\bin\64bit\` |
+
+### From source (macOS)
 
 ```sh
 just install
@@ -48,6 +78,8 @@ That builds the release dylib, packages it as a `.plugin` bundle, and
 copies it to `~/Library/Application Support/obs-studio/plugins/obs-ntsc.plugin`.
 First run also creates a `vendor/lib/libobs.0.dylib` symlink pointing at
 OBS.app's framework binary — see the build notes below.
+
+### Using the plugin
 
 Restart OBS, then on any async video source (webcam, media source):
 
@@ -88,10 +120,10 @@ warning to the OBS log dock.
 - **Async sources only.** Game capture, display capture, and browser sources
   use OBS's GPU pipeline — this filter doesn't apply to them. Would require
   a sync (graphics-side) filter variant, deferred.
-- **macOS / Apple Silicon is the only configuration currently built and
-  tested.** No x86_64 build, no universal binary, no Linux or Windows
-  packaging yet — those are intended but not wired up. The plugin won't
-  load in an OBS running under Rosetta until we ship an x86_64 build.
+- **Only macOS Apple Silicon has been user-tested.** GitHub Actions
+  produces Linux, Windows, and macOS Intel/universal binaries, but the
+  author hasn't loaded them into OBS on those platforms to confirm they
+  work end-to-end. Reports welcome.
 - **Not codesigned.** macOS will refuse to load it on first launch unless
   you right-click → Open the OBS.app or trust the plugin manually.
 - **CPU cost.** UYVY / NV12 sources pay a YUV → RGBA → ntsc-rs → YUV
