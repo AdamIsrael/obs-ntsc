@@ -5,6 +5,8 @@ NTSC / VHS effect on a source's frames. Written in Rust as an async video
 filter, so it operates on the CPU-side frame buffer of webcams, media files,
 and other async video sources.
 
+![Filter applied to a webcam](docs/demo.gif)
+
 ## Status
 
 v0.1. Built and tested on macOS / Apple Silicon against current OBS Studio
