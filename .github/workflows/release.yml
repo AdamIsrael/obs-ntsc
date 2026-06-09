@@ -1,0 +1,209 @@
+name: Release
+
+# Fires on a v* tag push (e.g. v0.2.0). Builds the plugin for four targets
+# on native runners, lipos a macOS universal binary, and attaches all
+# artifacts to a draft GitHub Release for manual publishing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: aarch64
+            target: aarch64-apple-darwin
+          - os: macos-13
+            arch: x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OBS
+        run: brew install --cask obs
+
+      - name: Vendor libobs (legacy dylib-name symlink for obs-sys)
+        run: |
+          mkdir -p vendor/lib
+          ln -sf "/Applications/OBS.app/Contents/Frameworks/libobs.framework/libobs" \
+                 vendor/lib/libobs.0.dylib
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          LIBOBS_PATH: ${{ github.workspace }}/vendor/lib
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package .plugin bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="dist/obs-ntsc.plugin"
+          mkdir -p "$BUNDLE/Contents/MacOS"
+          cp "target/${{ matrix.target }}/release/libobs_ntsc.dylib" \
+             "$BUNDLE/Contents/MacOS/obs-ntsc"
+          install_name_tool -id "@rpath/obs-ntsc" "$BUNDLE/Contents/MacOS/obs-ntsc"
+          cat > "$BUNDLE/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key><string>obs-ntsc</string>
+              <key>CFBundleIdentifier</key><string>com.adamisrael.obs-ntsc</string>
+              <key>CFBundleVersion</key><string>${{ github.ref_name }}</string>
+              <key>CFBundleShortVersionString</key><string>${{ github.ref_name }}</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleExecutable</key><string>obs-ntsc</string>
+              <key>CFBundlePackageType</key><string>BNDL</string>
+              <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+              <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          cd dist
+          zip -ry "obs-ntsc-${{ github.ref_name }}-macos-${{ matrix.arch }}.zip" obs-ntsc.plugin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/obs-ntsc-${{ github.ref_name }}-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  package-macos-universal:
+    name: macOS (universal)
+    needs: build-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Lipo the two bundles
+        run: |
+          set -euo pipefail
+          mkdir -p aarch64 x86_64
+          unzip -q "artifacts/obs-ntsc-${{ github.ref_name }}-macos-aarch64.zip" -d aarch64
+          unzip -q "artifacts/obs-ntsc-${{ github.ref_name }}-macos-x86_64.zip"  -d x86_64
+          mkdir -p "dist/obs-ntsc.plugin/Contents/MacOS"
+          cp aarch64/obs-ntsc.plugin/Contents/Info.plist dist/obs-ntsc.plugin/Contents/Info.plist
+          lipo -create \
+            aarch64/obs-ntsc.plugin/Contents/MacOS/obs-ntsc \
+            x86_64/obs-ntsc.plugin/Contents/MacOS/obs-ntsc  \
+            -output dist/obs-ntsc.plugin/Contents/MacOS/obs-ntsc
+          install_name_tool -id "@rpath/obs-ntsc" "dist/obs-ntsc.plugin/Contents/MacOS/obs-ntsc"
+          cd dist
+          zip -ry "obs-ntsc-${{ github.ref_name }}-macos-universal.zip" obs-ntsc.plugin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/obs-ntsc-${{ github.ref_name }}-macos-universal.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OBS dev deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y obs-studio
+          # obs-sys links `-lobs`; the apt package installs libobs.so.0 with
+          # no unversioned symlink, so the linker can't find it. Add one.
+          libobs_so0="$(ldconfig -p | awk '/libobs\.so\.0/ {print $NF; exit}')"
+          if [ -n "$libobs_so0" ]; then
+            sudo ln -sf "$libobs_so0" "$(dirname "$libobs_so0")/libobs.so"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/libobs_ntsc.so "dist/obs-ntsc.so"
+          cd dist
+          tar czf "obs-ntsc-${{ github.ref_name }}-linux-x86_64.tar.gz" obs-ntsc.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/obs-ntsc-${{ github.ref_name }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OBS
+        # obs-sys's build_win.rs reads the OBS install path from the registry,
+        # which the chocolatey installer populates. dumpbin (from MSVC) is used
+        # to generate a .lib from obs.dll.
+        run: choco install obs-studio --no-progress -y
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\obs_ntsc.dll dist\obs-ntsc.dll
+          Compress-Archive -Path dist\obs-ntsc.dll `
+            -DestinationPath dist\obs-ntsc-${{ github.ref_name }}-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/obs-ntsc-${{ github.ref_name }}-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub Release
+    needs:
+      - build-macos
+      - package-macos-universal
+      - build-linux
+      - build-windows
+    # Run even if some platform builds failed — partial releases are still
+    # useful, and the maintainer can choose what to publish.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          draft: true
+          fail_on_unmatched_files: false
+          generate_release_notes: true
